@@ -1,284 +1,330 @@
 """
-train_population_model.py  (fixed version)
+train_population_model.py  (PKL dataset version)
 
 Trains the population-level NN state-space model T1DSim_NN^P
-(CGMOHSUSimStateSpaceModel_V2) on the merged simulated dataset produced by
-merge_parts.py (population_development_dataset_merged.mat), following
-Section 2.2.2 of Roquemen-Echeverri et al. (arXiv:2508.05705).
+(CGMOHSUSimStateSpaceModel_V2) on the simulated .pkl dataset produced by
+CodeForGeneratingDataset/datasetPop.py, following Section 2.2.2 of
+Roquemen-Echeverri et al. (arXiv:2508.05705).
 
-EXPECTED INPUT FILE (written by merge_parts.py):
-    dataset_states  (N, T, 10)  order [Q1,Q2,S1,S2,I,X1,X2,X3,C2,C1]
-    dataset_inputs  (N, T, 2)   [u_I (U/hr), u_carbs (g)]
-    dataset_glucose (N, T)      mg/dL
-    N is a multiple of 5; every 5 consecutive rows = one meal pattern.
+EXPECTED INPUT (produced by datasetPop.py):
+  <SIMULATION_RESULTS_DIR>/
+    SIM002/POPULATION/TRAIN/                    *.pkl   TRAIN split
+    SIM002/POPULATION/VALIDATION/               *.pkl   VAL  split
+    SIM004/boluslate_*/TRAIN/                   *.pkl   delay augmentation (TRAIN)
+    SIM005/bolusCorrectionFactor_*/TRAIN/       *.pkl   correction bolus   (TRAIN)
 
-KEY FEATURES
-------------
-1. RAM: MAX_TRAIN_SCENARIOS / MAX_VAL_SCENARIOS cap how many traces are
-   loaded (whole 5-trace groups, so no meal pattern is split).
-2. Disk reads: for HDF5 (v7.3) files only the selected scenarios are read
-   (contiguous runs).
-3. RobustScaler is fit on a random subsample of TRAIN rows.
-4. Sanity check that channel 0 of the states is Q1 in mmol/kg
-   (Q1*18/0.16 should match dataset_glucose).
-5. C1 non-negativity floor is raw 0 expressed in scaled space.
-6. LR decay (e^-0.1 per full pass, per the paper) is scaled to the capped
-   epoch size.
-7. INPUT_COLUMN_PERM knob if inputs must be reordered.
+Each .pkl is a Pandas DataFrame with 11 dosing-problem groups x 2016
+timesteps (T = 2016 at Dt = 5 min).  Key columns used:
+
+  output_glucose    mg/dL   plant ground-truth glucose (Q1 target for L_fit)
+  input_insulin     U/h     total insulin administered
+  input_meal_carbs  g       carbohydrate intake
+  state_Q1 .. state_Ug      9 ODE compartment states (mmol/kg or model units)
+  dosing_problem_id          trajectory group within a file (0 = normal, 1-10 = errors)
+
+STATE ORDER in the 10-channel training array:
+  ch 0  Q1   (state_Q1,  mmol/kg)
+  ch 1  Q2   (state_Q2)
+  ch 2  S1   (state_S1)
+  ch 3  S2   (state_S2)
+  ch 4  I    (state_I)
+  ch 5  X1   (state_X1)
+  ch 6  X2   (state_X2)
+  ch 7  X3   (state_X3)
+  ch 8  C2   (state_Ug  -- gut absorption, paper notation C2)
+  ch 9  C1   (zero-padded -- carbs on board, introduced by the NN; Section 2.2.2)
+
+The 10th compartment C1 has no ground truth in the PKL data.  It is
+initialized to 0 at every timestep and its MSE is masked out of L_consistency
+(per Section 2.2.2).  The soft non-negativity floor (beta term) still applies.
+
+WHAT CHANGED FROM THE OLD .mat VERSION
+---------------------------------------
+1. Data source: merged .mat -> individual .pkl files, split by directory.
+2. State order: 9 PKL states + C1 = 0 (channel 9).
+3. STATE_WEIGHTS: corrected to match paper Sec. 2.2.3 (sum = 1).
+4. Train/val split: pre-assigned by directory (TRAIN / VALIDATION sub-folders).
+5. Validation window overlap: 0 % (paper says "no overlap").
+6. Glucose thresholds (70, 250 mg/dL) computed locally -- no t1dsim_ai.utils.preprocess.
 """
 
 import os
+import glob
+import sys
 import time
+import types
+
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from pickle import dump
 
-try:
-    import scipy.io as sio
-except ImportError:
-    sio = None
+from sklearn.preprocessing import RobustScaler
 
-try:
-    import h5py
-except ImportError:
-    h5py = None
+# ---------------------------------------------------------------------------
+# Compatibility patch: allow unpickling files saved with older pandas (<2.0)
+# ---------------------------------------------------------------------------
+if "pandas.core.indexes.numeric" not in sys.modules:
+    try:
+        import pandas.core.indexes.numeric  # noqa: F401
+    except ModuleNotFoundError:
+        import pandas.core.indexes.base as _pib
+        _nm = types.ModuleType("pandas.core.indexes.numeric")
+        _nm.Int64Index   = pd.Index  # type: ignore[attr-defined]
+        _nm.Float64Index = pd.Index  # type: ignore[attr-defined]
+        _nm.UInt64Index  = pd.Index  # type: ignore[attr-defined]
+        sys.modules["pandas.core.indexes.numeric"] = _nm
+        setattr(_pib, "Int64Index",   pd.Index)
+        setattr(_pib, "Float64Index", pd.Index)
+        setattr(_pib, "UInt64Index",  pd.Index)
 
+# t1dsim_ai submodule -- populated separately by the user
 from t1dsim_ai.population_model import CGMOHSUSimStateSpaceModel_V2
 from t1dsim_ai.options import n_neurons_pop
-from t1dsim_ai.utils.preprocess import scale_single_state, scale_inverse_Q1
+
 
 # ==============================================================================
-# CONFIG - EDIT THESE
+# CONFIG  -  EDIT THESE
 # ==============================================================================
-MERGED_MAT_PATH = r"C:\Users\pc\Downloads\population\population_development_dataset_merged.mat"
-OUTPUT_DIR = "models/PopulationModel/"     # tip: use a NEW folder, e.g. "models/PopulationModel_new/" (keep trailing /)
+SIMULATION_RESULTS_DIR = r"C:\Users\pc\Downloads\train\CodeForGeneratingDataset\simulation_results"
+OUTPUT_DIR    = "models/PopulationModel/"
 MODEL_FILENAME = "population_model_trained.pt"
-WARM_START_CHECKPOINT = None
+WARM_START_CHECKPOINT = None   # path to a .pt file for warm-starting, or None
 
-SEQ_LEN = 61
-OVERLAP = 0.75
+# Sub-directory patterns scanned for each split (relative to SIMULATION_RESULTS_DIR).
+# Glob wildcards (*) are supported at the directory level.
+TRAIN_SCAN_PATTERNS = [
+    os.path.join("SIM002", "POPULATION", "TRAIN"),
+    os.path.join("SIM004", "boluslate_*", "TRAIN"),
+    os.path.join("SIM005", "bolusCorrectionFactor_*", "TRAIN"),
+]
+VAL_SCAN_PATTERNS = [
+    os.path.join("SIM002", "POPULATION", "VALIDATION"),
+]
+
+# --- Hyperparameters (Sec. 2.2.3 of the paper) ---
+SEQ_LEN    = 61     # M = 5 h at Dt=5 min -> 60 intervals + 1 initial state = 61 points
+OVERLAP    = 0.75   # 75 % overlap between consecutive TRAINING windows
 BATCH_SIZE = 128
 MAX_EPOCHS = 150
-PATIENCE = 20            # must be < MAX_EPOCHS to ever trigger
+PATIENCE   = 20     # early-stopping patience
 
-MAX_TRAIN_BATCHES_PER_EPOCH = 3000   # None = every window every epoch
-MAX_VAL_BATCHES_PER_EPOCH = 1000     # None = every window every epoch
-LR = 1e-3
-LR_DECAY_PER_EPOCH = np.exp(-0.1)   # paper: x e^-0.1 per FULL pass over the training windows
-# Our "epoch" is only MAX_TRAIN_BATCHES_PER_EPOCH batches (a fraction of a full pass), so applying
-# e^-0.1 per capped epoch decays the LR ~10x too fast per unit of data seen (LR ~ 7e-6 by epoch 50).
-# True = scale the decay so it matches the paper's schedule per full pass.
-SCALE_LR_DECAY_TO_FULL_EPOCH = True
-WEIGHT_DECAY = 0.0
-ALPHA = 0.7
-BETA = 0.08
-TRAIN_FRACTION = 0.6
-VAL_FRACTION = 0.2
+MAX_TRAIN_BATCHES_PER_EPOCH = 3000   # None = all windows every epoch
+MAX_VAL_BATCHES_PER_EPOCH   = 1000   # None = all windows every epoch
+
+LR                       = 1e-3
+LR_DECAY_PER_EPOCH       = np.exp(-0.1)   # gamma = e^{-0.1} per FULL data pass
+SCALE_LR_DECAY_TO_FULL_EPOCH = True       # rescale gamma if epoch is capped
+WEIGHT_DECAY             = 0.0
+
+ALPHA = 0.7    # balance L_fit vs. L_consistency (Eq. 5)
+BETA  = 0.08   # soft non-negativity constraint weight (Eq. 9)
+
 SEED = 0
 
-# --- memory knobs ---
-# Max number of TRACES (rows) loaded per split. Rounded down to whole groups of 5.
-# RAM per split ~= traces * T(2016) * 12 channels * 4 bytes ~= traces * 97 KB.
-#   40000 traces ~= 3.9 GB | 8000 traces ~= 0.8 GB.  None = use the full split.
-MAX_TRAIN_SCENARIOS = 40000
-MAX_VAL_SCENARIOS = 8000
-SCALER_FIT_ROWS = 4_000_000   # random rows used to fit the RobustScaler
-CHUNK_SCENARIOS = 2000        # scenarios per disk read
-CHUNK_ROWS = 500_000          # rows per scaler.transform() call
+# --- Memory caps ---
+MAX_TRAIN_SCENARIOS = 40_000   # max trajectories for TRAIN (None = unlimited)
+MAX_VAL_SCENARIOS   =  8_000   # max trajectories for VAL   (None = unlimited)
+SCALER_FIT_ROWS     = 4_000_000
+CHUNK_ROWS          = 500_000
 
-# If your population model expects input columns in a different order than
-# [u_I, u_carbs], set e.g. [1, 0]. None = keep the file's order.
-INPUT_COLUMN_PERM = None
+# --- Physical constants ---
+_VDG           = 0.16    # glucose volume of distribution (L/kg) [Resalat 2019]
+_MGDL_PER_MMOL = 18.0   # 1 mmol/L glucose = 18 mg/dL
 
+# --- Dataset structure ---
+T_SIM    = 2016   # 7 days x 288 samples/day at Dt=5 min
+N_STATES = 10
+N_INPUTS = 2
+C1_INDEX = 9      # C1 channel -- no ground truth; MSE masked, soft floor active
+
+# State channel order: [Q1, Q2, S1, S2, I, X1, X2, X3, C2(=Ug), C1]
 STATE_ORDER = ["Q1", "Q2", "S1", "S2", "I", "X1", "X2", "X3", "C2", "C1"]
-C1_INDEX = STATE_ORDER.index("C1")
 
+# PKL column -> channel mapping (channels 0-8); channel 9 (C1) is zero-filled
+PKL_STATE_COLS = [
+    "state_Q1", "state_Q2", "state_S1", "state_S2",
+    "state_I",  "state_X1", "state_X2", "state_X3", "state_Ug",
+]
+PKL_INPUT_COLS = ["input_insulin", "input_meal_carbs"]   # [u_I (U/h), u_carbs (g)]
+
+# State weights w_i (paper Sec. 2.2.3).  1-indexed paper notation -> 0-indexed channels:
+#   w_{1..6, 10} = 1/12   channels 0,1,2,3,4,5,9  (Q1,Q2,S1,S2,I,X1,C1)
+#   w_7          = 5/24   channel 6                 (X2)
+#   w_8          = 1/6    channel 7                 (X3) [paper "0.16" = 1/6 exactly]
+#   w_9          = 1/24   channel 8                 (C2 / Ug)
+# Sum = 7*(1/12) + 5/24 + 1/6 + 1/24 = 14/24 + 5/24 + 4/24 + 1/24 = 24/24 = 1.0
 STATE_WEIGHTS = np.array(
-    [5/24, 1/6, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 1/24],
+    [1/12, 1/12, 1/12, 1/12, 1/12, 1/12, 5/24, 1/6, 1/24, 1/12],
     dtype=np.float32,
 )
+assert abs(STATE_WEIGHTS.sum() - 1.0) < 1e-5, "STATE_WEIGHTS must sum to 1"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Generator constants, used only for the Q1 sanity check
-_VDG = 0.16
-_MGDL_PER_MMOL = 18.0
-
 
 # ==============================================================================
-# Data loading
+# PKL Data Loading
 # ==============================================================================
-def _load_var_scipy(path, key):
-    d = sio.loadmat(path, variable_names=[key], simplify_cells=True)
-    return d[key]
+
+def _discover_pkl_files(base_dir, patterns):
+    """Return a sorted, deduplicated list of .pkl paths matching all patterns."""
+    files: set = set()
+    for pat in patterns:
+        full_glob = os.path.join(base_dir, pat, "*.pkl")
+        files.update(glob.glob(full_glob))
+    return sorted(files)
 
 
-def _detect_backend(path):
-    if sio is not None:
-        try:
-            sio.whosmat(path)
-            return "scipy"
-        except Exception:
-            pass
-    if h5py is not None:
-        return "h5py"
-    raise RuntimeError("Need scipy and/or h5py installed to read this .mat file")
+def _read_pkl_trajectories(pkl_path, t_sim=T_SIM):
+    """
+    Read one .pkl file and extract one trajectory per dosing_problem_id.
+
+    Returns
+    -------
+    states : np.ndarray  shape (n_dp, T, 10)  float32
+                         channels [Q1..X3, Ug, C1=0]
+    inputs : np.ndarray  shape (n_dp, T,  2)  float32
+                         columns [u_I (U/h), u_carbs (g)]
+    Both are None if no valid trajectories were found.
+    """
+    df = pd.read_pickle(pkl_path)
+
+    traj_states, traj_inputs = [], []
+
+    for _, grp in df.groupby("dosing_problem_id", sort=True):
+        if len(grp) != t_sim:
+            # Malformed or partial trajectory -- skip silently
+            continue
+        grp = grp.reset_index(drop=True)
+
+        # Channels 0-8: nine ODE states from the PKL
+        st9 = grp[PKL_STATE_COLS].values.astype(np.float32)      # (T, 9)
+
+        # Channel 9: C1 -- no ground truth, zero-initialized (Section 2.2.2)
+        c1 = np.zeros((t_sim, 1), dtype=np.float32)
+        st = np.concatenate([st9, c1], axis=1)                    # (T, 10)
+
+        # Inputs: [u_I (U/h), u_carbs (g)]
+        u = grp[PKL_INPUT_COLS].values.astype(np.float32)         # (T, 2)
+
+        traj_states.append(st)
+        traj_inputs.append(u)
+
+    if not traj_states:
+        return None, None
+
+    return np.stack(traj_states), np.stack(traj_inputs)           # (n_dp, T, 10/2)
 
 
-def get_dataset_dims(path, backend):
-    if backend == "scipy":
-        shapes = {name: shape for name, shape, _ in sio.whosmat(path)}
-        n_scenarios, T, n_states = shapes["dataset_states"]
-        n_inputs = shapes["dataset_inputs"][-1]
-        return n_scenarios, T, n_states, n_inputs
-    with h5py.File(path, "r") as f:
-        n_states, T, n_scenarios = f["dataset_states"].shape   # on disk (10,T,N)
-        n_inputs = f["dataset_inputs"].shape[0]                # on disk (2,T,N)
-    return n_scenarios, T, n_states, n_inputs
+def build_split_arrays(base_dir, patterns, max_scenarios=None, seed=0, t_sim=T_SIM):
+    """
+    Discover, optionally cap, and load all PKL trajectories for a split.
 
+    Parameters
+    ----------
+    base_dir      : root of simulation_results/
+    patterns      : list of sub-directory glob patterns (see TRAIN/VAL_SCAN_PATTERNS)
+    max_scenarios : maximum number of trajectories to keep (None = unlimited)
+    seed          : RNG seed for file shuffle -- ensures repeatable capping
 
-_q1_checked = False
+    Returns
+    -------
+    x : np.ndarray  (N, T, 10)  float32  -- states
+    u : np.ndarray  (N, T,  2)  float32  -- inputs
+    """
+    all_files = _discover_pkl_files(base_dir, patterns)
+    if not all_files:
+        raise FileNotFoundError(
+            f"No .pkl files found under {base_dir!r} with patterns {patterns}.\n"
+            "Have you run datasetPop.py to generate the dataset?"
+        )
+    print(f"  {len(all_files)} .pkl files discovered.")
 
+    # Shuffle file order so the cap draws a representative subsample
+    rng = np.random.RandomState(seed)
+    file_order = rng.permutation(len(all_files))
 
-def _check_q1_channel(states_chunk, glucose_chunk):
-    """Warn once if channel 0 doesn't look like Q1 (mmol/kg) matching glucose."""
-    global _q1_checked
-    if _q1_checked:
-        return
-    _q1_checked = True
-    implied = states_chunk[..., 0] * _MGDL_PER_MMOL / _VDG
-    err = float(np.abs(implied - glucose_chunk).max())
-    if err > 1.0:
-        print(f"  WARNING: channel 0 of dataset_states does not match Q1*18/0.16 vs "
-              f"dataset_glucose (max abs diff {err:.1f} mg/dL). If this file was not made by "
-              f"merge_parts.py, the state order may be wrong (channel 0 must be Q1).")
-    else:
-        print(f"  Q1 sanity check OK (max diff {err:.3f} mg/dL) - state order looks correct.")
-
-
-def _iter_raw_chunks_scipy(path, chunk_size):
-    dataset_states = _load_var_scipy(path, "dataset_states")
-    dataset_inputs = _load_var_scipy(path, "dataset_inputs")
-    dataset_glucose = _load_var_scipy(path, "dataset_glucose")
-    N = dataset_states.shape[0]
-    for start in range(0, N, chunk_size):
-        end = min(start + chunk_size, N)
-        states_chunk = dataset_states[start:end].astype(np.float32)
-        inputs_chunk = dataset_inputs[start:end].astype(np.float32)
-        glucose_chunk = dataset_glucose[start:end].astype(np.float32)
-        _check_q1_channel(states_chunk, glucose_chunk)
-        states_chunk[..., 0] = glucose_chunk
-        yield start, end, states_chunk, inputs_chunk
-
-
-def fill_split_buffer(path, backend, idx, T, n_states, n_inputs, chunk_size=CHUNK_SCENARIOS):
-    """Loads only scenarios `idx` (sorted ascending) into flat float32 buffers
-    of shape (len(idx)*T, n_states) / (len(idx)*T, n_inputs)."""
-    idx = np.asarray(idx)
-    assert np.all(np.diff(idx) > 0), "idx must be strictly ascending"
-
-    x_flat = np.empty((len(idx) * T, n_states), dtype=np.float32)
-    u_flat = np.empty((len(idx) * T, n_inputs), dtype=np.float32)
-
-    if backend == "h5py":
-        # Read only the needed scenarios, as contiguous runs (each capped at chunk_size).
-        runs = np.split(idx, np.where(np.diff(idx) != 1)[0] + 1)
-        pos = 0
-        with h5py.File(path, "r") as f:
-            ds_s, ds_i, ds_g = f["dataset_states"], f["dataset_inputs"], f["dataset_glucose"]
-            for run in runs:
-                run_start, run_end = int(run[0]), int(run[-1]) + 1
-                for a in range(run_start, run_end, chunk_size):
-                    b = min(a + chunk_size, run_end)
-                    c = b - a
-                    st = np.transpose(ds_s[:, :, a:b], (2, 1, 0)).astype(np.float32, order="C")
-                    ip = np.transpose(ds_i[:, :, a:b], (2, 1, 0)).astype(np.float32, order="C")
-                    gl = np.transpose(ds_g[:, a:b], (1, 0)).astype(np.float32, order="C")
-                    _check_q1_channel(st, gl)
-                    st[..., 0] = gl
-                    x_flat[pos * T:(pos + c) * T] = st.reshape(c * T, n_states)
-                    u_flat[pos * T:(pos + c) * T] = ip.reshape(c * T, n_inputs)
-                    pos += c
-        assert pos == len(idx)
-        return x_flat, u_flat
-
-    # scipy backend (legacy non-v7.3 files): must load whole variables once
-    pos_of = {raw_i: split_pos for split_pos, raw_i in enumerate(idx)}
-    n_found = 0
-    for start, end, states_chunk, inputs_chunk in _iter_raw_chunks_scipy(path, chunk_size):
-        in_range = idx[(idx >= start) & (idx < end)]
-        for raw_i in in_range:
-            local = raw_i - start
-            r0 = pos_of[raw_i] * T
-            x_flat[r0:r0 + T] = states_chunk[local]
-            u_flat[r0:r0 + T] = inputs_chunk[local]
-            n_found += 1
-        if n_found == len(idx):
+    x_chunks, u_chunks, n_loaded = [], [], 0
+    for fi in file_order:
+        fpath = all_files[fi]
+        st, u = _read_pkl_trajectories(fpath, t_sim)
+        if st is None:
+            continue
+        x_chunks.append(st)
+        u_chunks.append(u)
+        n_loaded += st.shape[0]
+        if max_scenarios is not None and n_loaded >= max_scenarios:
             break
-    return x_flat, u_flat
+
+    if not x_chunks:
+        raise ValueError("No valid trajectories could be loaded from any .pkl file.")
+
+    x_all = np.concatenate(x_chunks, axis=0)   # (N, T, 10)
+    u_all = np.concatenate(u_chunks, axis=0)   # (N, T,  2)
+
+    if max_scenarios is not None and x_all.shape[0] > max_scenarios:
+        x_all = x_all[:max_scenarios]
+        u_all = u_all[:max_scenarios]
+
+    n = x_all.shape[0]
+    x_gb = x_all.nbytes / 1e9
+    u_gb = u_all.nbytes / 1e9
+    print(f"  Loaded {n} trajectories x T={t_sim} -> states {x_gb:.2f} GB, inputs {u_gb:.2f} GB")
+    return x_all, u_all
 
 
-def transform_in_place(scaler, flat_array, chunk_rows=CHUNK_ROWS):
+def _transform_in_place(scaler, flat_array, chunk_rows=CHUNK_ROWS):
     n = flat_array.shape[0]
     for start in range(0, n, chunk_rows):
         end = min(start + chunk_rows, n)
         flat_array[start:end] = scaler.transform(flat_array[start:end]).astype(np.float32)
 
 
-def group_split(n_scenarios, group_size=5, train_frac=0.6, val_frac=0.2, seed=0,
-                max_train=None, max_val=None):
-    """Train/val/test split over groups of `group_size` consecutive rows (one
-    meal pattern). max_train / max_val cap the number of ROWS per split
-    (rounded down to whole groups)."""
-    assert n_scenarios % group_size == 0, (
-        f"n_scenarios ({n_scenarios}) isn't divisible by group_size ({group_size}) - "
-        "re-run merge_parts.py (use --rare drop, or keep with padding)."
-    )
-    n_groups = n_scenarios // group_size
-    rng = np.random.RandomState(seed)
-    group_order = rng.permutation(n_groups)
+# ==============================================================================
+# Scale helpers (replaces t1dsim_ai.utils.preprocess which depends on saved files)
+# ==============================================================================
 
-    n_train_groups = int(round(n_groups * train_frac))
-    n_val_groups = int(round(n_groups * val_frac))
+def _glucose_mgdl_to_q1_scaled(glucose_mgdl, scaler_states):
+    """Convert glucose (mg/dL) -> Q1 (mmol/kg) -> scaled channel 0."""
+    q1_mmolkg = glucose_mgdl / _MGDL_PER_MMOL * _VDG
+    return float((q1_mmolkg - scaler_states.center_[0]) / scaler_states.scale_[0])
 
-    train_groups = group_order[:n_train_groups]
-    val_groups = group_order[n_train_groups:n_train_groups + n_val_groups]
-    test_groups = group_order[n_train_groups + n_val_groups:]
 
-    if max_train is not None:
-        train_groups = train_groups[: max(1, max_train // group_size)]
-    if max_val is not None:
-        val_groups = val_groups[: max(1, max_val // group_size)]
-
-    def groups_to_indices(groups):
-        idx = (groups[:, None] * group_size + np.arange(group_size)[None, :]).reshape(-1)
-        return np.sort(idx)
-
-    return (groups_to_indices(train_groups),
-            groups_to_indices(val_groups),
-            groups_to_indices(test_groups))
+def _q1_scaled_to_mgdl(q1_scaled_arr, scaler_states):
+    """Inverse-scale channel 0 from scaled space -> Q1 (mmol/kg) -> mg/dL."""
+    q1_mmolkg = q1_scaled_arr * scaler_states.scale_[0] + scaler_states.center_[0]
+    return q1_mmolkg * _MGDL_PER_MMOL / _VDG
 
 
 # ==============================================================================
-# Framed batch sampler (true 75% overlap, index pairs only)
+# Framed window sampler
 # ==============================================================================
+
 class FramedWindowSampler:
-    def __init__(self, x_est, u_fit, seq_len, overlap, batch_size, device, seed=0):
-        self.x_est = x_est
-        self.u_fit = u_fit
-        self.seq_len = seq_len
+    """
+    Generates batches of fixed-length overlapping windows from (N, T, C) arrays.
+
+    Training  : overlap = 0.75  (75 % overlap, Sec. 2.2.3)
+    Validation: overlap = 0.0   ("sequences of size M with no overlap", Sec. 2.2.3)
+    """
+
+    def __init__(self, x_data, u_data, seq_len, overlap, batch_size, device, seed=0):
+        self.x_data     = x_data
+        self.u_data     = u_data
+        self.seq_len    = seq_len
         self.batch_size = batch_size
-        self.device = device
-        self.N, self.T, self.n_states = x_est.shape
+        self.device     = device
+        self.N, self.T, _ = x_data.shape
 
-        self.hop = max(1, int((1 - overlap) * seq_len))
-        starts = np.arange(0, self.T - self.seq_len + 1, self.hop)
+        self.hop = max(1, int(round((1.0 - overlap) * seq_len)))
+        starts   = np.arange(0, self.T - seq_len + 1, self.hop)
 
-        scenario_grid, start_grid = np.meshgrid(np.arange(self.N), starts, indexing="ij")
-        self.pairs = np.stack([scenario_grid.ravel(), start_grid.ravel()], axis=1).astype(np.int32)
-        del scenario_grid, start_grid
+        sc_grid, st_grid = np.meshgrid(np.arange(self.N), starts, indexing="ij")
+        self.pairs = np.stack([sc_grid.ravel(), st_grid.ravel()], axis=1).astype(np.int32)
+        del sc_grid, st_grid
 
         self.rng = np.random.RandomState(seed)
         self._reshuffle()
@@ -293,153 +339,215 @@ class FramedWindowSampler:
     def next_batch(self):
         if self.pos + self.batch_size > len(self.pairs):
             self._reshuffle()
-        chosen = self.epoch_order[self.pos:self.pos + self.batch_size]
+        chosen    = self.epoch_order[self.pos:self.pos + self.batch_size]
         self.pos += self.batch_size
         return self.batch_from_pairs(self.pairs[chosen])
 
     def get_fixed_subset(self, n_batches):
-        """Fixed set of validation batches, chosen once and replayed each epoch so
-        val_loss is comparable across epochs."""
+        """Fixed val subset, chosen once and reused every epoch for fair comparison."""
         n_needed = min(n_batches * self.batch_size, len(self.pairs))
-        chosen = self.rng.permutation(len(self.pairs))[:n_needed]
+        chosen   = self.rng.permutation(len(self.pairs))[:n_needed]
         return [self.pairs[chosen[s:s + self.batch_size]]
                 for s in range(0, len(chosen), self.batch_size)]
 
     def batch_from_pairs(self, pair_batch):
-        scenario_idx = pair_batch[:, 0]
-        start_idx = pair_batch[:, 1]
-        idx_range = start_idx[:, None] + np.arange(self.seq_len)[None, :]
+        sc_idx    = pair_batch[:, 0]
+        st_idx    = pair_batch[:, 1]
+        idx_range = st_idx[:, None] + np.arange(self.seq_len)[None, :]
 
-        x_batch = self.x_est[scenario_idx[:, None], idx_range]   # (B, seq_len, 10)
-        u_batch = self.u_fit[scenario_idx[:, None], idx_range]   # (B, seq_len, 2)
+        x_batch = self.x_data[sc_idx[:, None], idx_range]   # (B, M, 10)
+        u_batch = self.u_data[sc_idx[:, None], idx_range]   # (B, M,  2)
 
+        # Rearrange to (M, B, C) for the simulator
         x_batch = np.transpose(x_batch, (1, 0, 2))
         u_batch = np.transpose(u_batch, (1, 0, 2))
-        x0 = x_batch[0]
+        x0      = x_batch[0]                                 # (B, 10) initial state
 
         return (
-            torch.tensor(x0, dtype=torch.float32, device=self.device),
+            torch.tensor(x0,      dtype=torch.float32, device=self.device),
             torch.tensor(u_batch, dtype=torch.float32, device=self.device),
             torch.tensor(x_batch, dtype=torch.float32, device=self.device),
         )
 
 
 # ==============================================================================
-# Simulator
+# Forward Euler simulator (Algorithm 1)
 # ==============================================================================
-class ForwardEulerSimulatorPop(nn.Module):
-    def __init__(self, ss_pop_model, cgm_min, cgm_max, ts=5.0):
-        super().__init__()
-        self.ss_pop_model = ss_pop_model
-        self.ts = ts
-        self.cgm_min = cgm_min
-        self.cgm_max = cgm_max
 
-    def adjust_cgm(self, x):
-        return torch.clamp(x, min=self.cgm_min, max=self.cgm_max)
+class ForwardEulerSimulatorPop(nn.Module):
+    """
+    Integrates the NN state-space model using Euler's method (Algorithm 1).
+
+        x_sim(m+Dm) = x_sim(m) + Dm * N(x_sim(m), u(m); Theta_P)
+
+    Q1 (channel 0) is clamped to physiologically plausible glucose range
+    after every step.
+    """
+
+    def __init__(self, ss_model, cgm_min_scaled, cgm_max_scaled, ts=5.0):
+        super().__init__()
+        self.ss_model  = ss_model
+        self.ts        = ts
+        self.cgm_min   = cgm_min_scaled
+        self.cgm_max   = cgm_max_scaled
+
+    def _clamp_q1(self, x):
+        return torch.cat(
+            [torch.clamp(x[:, [0]], min=self.cgm_min, max=self.cgm_max),
+             x[:, 1:]],
+            dim=1,
+        )
 
     def forward(self, x0_batch, u_batch):
-        X_sim_list = []
+        """
+        Parameters
+        ----------
+        x0_batch : (B, 10)   initial states (scaled)
+        u_batch  : (M, B, 2) inputs over sequence of length M
+
+        Returns
+        -------
+        x_list   : (M, B, 10) simulated states x_sim(0) .. x_sim(M-1)
+        """
         x_step = x0_batch
-        for step in range(u_batch.shape[0]):
-            u_step = u_batch[step]
-            X_sim_list.append(x_step)
-            dx = self.ss_pop_model(x_step, u_step)
-            x_step = x_step + self.ts * dx
-            x_step = torch.cat([self.adjust_cgm(x_step[:, [0]]), x_step[:, 1:]], dim=1)
-        return torch.stack(X_sim_list, 0)
+        x_list = []
+        for m in range(u_batch.shape[0]):
+            x_list.append(x_step)
+            dx     = self.ss_model(x_step, u_batch[m])
+            x_step = self._clamp_q1(x_step + self.ts * dx)
+        return torch.stack(x_list, dim=0)   # (M, B, 10)
 
 
 # ==============================================================================
-# Loss (Eq. 5-9)
+# Loss  (Equations 5 - 9 of the paper)
 # ==============================================================================
+
 class PopulationLoss:
+    """
+    L_total = L_fit + alpha * L_consistency                           (Eq. 5)
+
+    L_fit   = (1/B) * (1/M) * sum_{b,m} (y_sim - y)^2 * P(y_sim, y) (Eq. 6)
+    P(y_sim, y):  1 normally, 2 for hypo under-prediction,
+                  6 for extreme hyper under-prediction                 (Eq. 7)
+
+    L_consistency = sum_i  w_i * L^i_consistency                       (Eq. 8)
+    L^i_consist.  = MSE_i  +  beta * sum_{b,m} max[0, -(x_sim_i - min(x_i))]
+                                                                       (Eq. 9)
+    MSE for C1 (channel 9) is masked out -- no ground truth.
+    """
+
     def __init__(self, state_weights, state_min, c1_index, alpha=0.7, beta=0.08):
-        self.w = torch.tensor(state_weights, dtype=torch.float32)
-        self.state_min = torch.tensor(state_min, dtype=torch.float32)
-        self.c1_index = c1_index
-        self.alpha = alpha
-        self.beta = beta
+        self.w         = torch.tensor(state_weights, dtype=torch.float32)
+        self.state_min = torch.tensor(state_min,     dtype=torch.float32)
+        self.c1_index  = c1_index
+        self.alpha     = alpha
+        self.beta      = beta
 
     def to(self, device):
-        self.w = self.w.to(device)
+        self.w         = self.w.to(device)
         self.state_min = self.state_min.to(device)
         return self
 
     @staticmethod
-    def fit_penalty(y_sim, y_true, lim_inferior, lim_superior):
-        penalty = torch.ones_like(y_true)
-        penalty[torch.logical_and(y_true <= lim_inferior, y_sim > y_true)] = 2.0
-        penalty[torch.logical_and(y_true >= lim_superior, y_sim < y_true)] = 6.0
-        return penalty
+    def _penalty(y_sim, y_true, lim_inf, lim_sup):
+        """Eq. 7 -- P(y_sim, y) in {1, 2, 6}."""
+        p = torch.ones_like(y_true)
+        # Hypo: true <= 70 and model over-predicts (y_sim > y_true)
+        p[torch.logical_and(y_true <= lim_inf, y_sim >  y_true)] = 2.0
+        # Extreme hyper: true >= 250 and model under-predicts
+        p[torch.logical_and(y_true >= lim_sup, y_sim <  y_true)] = 6.0
+        return p
 
-    def __call__(self, x_sim, x_true, lim_inferior_scaled, lim_superior_scaled):
-        y_sim = x_sim[1:, :, [0]]
+    def __call__(self, x_sim, x_true, lim_inf_scaled, lim_sup_scaled):
+        """
+        Parameters
+        ----------
+        x_sim, x_true : (M, B, 10)  --  step 0 is initial condition (ground truth IC),
+                                         loss is computed over steps 1 .. M-1.
+
+        Returns
+        -------
+        L_total         : torch scalar (differentiable)
+        L_fit_val       : float (for logging)
+        L_consistency_val: float (for logging)
+        """
+        # ---- L_fit: glucose compartment Q1 (channel 0) only ----
+        y_sim  = x_sim [1:, :, [0]]   # (M-1, B, 1)
         y_true = x_true[1:, :, [0]]
-        penalty = self.fit_penalty(y_sim, y_true, lim_inferior_scaled, lim_superior_scaled)
-        L_fit = torch.mean((y_sim - y_true) ** 2 * penalty)
+        P      = self._penalty(y_sim, y_true, lim_inf_scaled, lim_sup_scaled)
+        L_fit  = torch.mean((y_sim - y_true) ** 2 * P)
 
-        err = x_sim[1:] - x_true[1:]
-        mse_per_state = torch.mean(err ** 2, dim=(0, 1))
+        # ---- L_consistency: all 10 compartments ----
+        err           = x_sim[1:] - x_true[1:]                       # (M-1, B, 10)
+        mse_per_state = torch.mean(err ** 2, dim=(0, 1))              # (10,)
 
-        # Enforce MSE^{C_1} = 0 as per Section 2.2.1
-        mask = torch.ones_like(mse_per_state)
-        mask[self.c1_index] = 0.0
-        mse_per_state = mse_per_state * mask
+        # Mask C1 MSE to 0 (no ground truth; Section 2.2.2)
+        mse_mask = torch.ones(N_STATES, device=mse_per_state.device)
+        mse_mask[self.c1_index] = 0.0
+        mse_per_state = mse_per_state * mse_mask
 
-        # state_min already holds every floor in SCALED space (C1's is set in main()).
-        floor = self.state_min
-        soft_constraint = torch.clamp(-(x_sim[1:] - floor), min=0.0)
-        soft_penalty_per_state = torch.sum(soft_constraint, dim=(0, 1))
+        # Soft non-negativity floor: penalize x_sim_i < min(x_i)   (second term, Eq. 9)
+        floor          = self.state_min.view(1, 1, N_STATES)
+        violation      = torch.clamp(-(x_sim[1:] - floor), min=0.0)
+        soft_per_state = torch.sum(violation, dim=(0, 1))             # (10,)
 
-        per_state_loss = mse_per_state + self.beta * soft_penalty_per_state
-        L_consistency = torch.sum(self.w * per_state_loss)
+        per_state_loss = mse_per_state + self.beta * soft_per_state
+        L_consistency  = torch.sum(self.w * per_state_loss)
 
         L_total = L_fit + self.alpha * L_consistency
         return L_total, L_fit.item(), L_consistency.item()
 
 
 # ==============================================================================
-# Main
+# Main training routine
 # ==============================================================================
+
 def main():
     np.random.seed(SEED)
     torch.manual_seed(SEED)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(f"Inspecting merged dataset at: {MERGED_MAT_PATH}")
+    # -----------------------------------------------------------------------
+    # 1. Load TRAIN trajectories from PKL tree
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print(f"Loading TRAIN from: {SIMULATION_RESULTS_DIR}")
+    print(f"Patterns: {TRAIN_SCAN_PATTERNS}")
     t0 = time.time()
-    backend = _detect_backend(MERGED_MAT_PATH)
-    n_scenarios, T, n_states, n_inputs = get_dataset_dims(MERGED_MAT_PATH, backend)
-    print(f"  backend: {backend} | shape: ({n_scenarios}, {T}, {n_states}) states, "
-          f"({n_scenarios}, {T}, {n_inputs}) inputs [{time.time()-t0:.2f}s]")
-
-    print("Splitting scenarios into train/val/test (grouped by meal pattern) ...")
-    train_idx, val_idx, test_idx = group_split(
-        n_scenarios, group_size=5, train_frac=TRAIN_FRACTION, val_frac=VAL_FRACTION, seed=SEED,
-        max_train=MAX_TRAIN_SCENARIOS, max_val=MAX_VAL_SCENARIOS,
+    x_train_raw, u_train_raw = build_split_arrays(
+        SIMULATION_RESULTS_DIR, TRAIN_SCAN_PATTERNS,
+        max_scenarios=MAX_TRAIN_SCENARIOS, seed=SEED,
     )
-    est_gb = (len(train_idx) + len(val_idx)) * T * (n_states + n_inputs) * 4 / 1e9
-    print(f"  train: {len(train_idx)} | val: {len(val_idx)} | test (unused, never read): {len(test_idx)} "
-          f"| approx RAM for data: {est_gb:.1f} GB")
+    n_train = x_train_raw.shape[0]
+    print(f"TRAIN: {n_train} trajectories  [{time.time()-t0:.1f}s]")
 
-    print(f"Loading TRAIN scenarios (chunks of {CHUNK_SCENARIOS}) ...")
+    # -----------------------------------------------------------------------
+    # 2. Load VAL trajectories  (SIM002 / POPULATION / VALIDATION only)
+    # -----------------------------------------------------------------------
+    print(f"\nLoading VAL from: {SIMULATION_RESULTS_DIR}")
+    print(f"Patterns: {VAL_SCAN_PATTERNS}")
     t0 = time.time()
-    x_train_flat, u_train_flat = fill_split_buffer(
-        MERGED_MAT_PATH, backend, train_idx, T, n_states, n_inputs)
-    if INPUT_COLUMN_PERM is not None:
-        u_train_flat = np.ascontiguousarray(u_train_flat[:, INPUT_COLUMN_PERM])
-    print(f"  done in {time.time()-t0:.1f}s | x {x_train_flat.nbytes/1e9:.2f} GB, "
-          f"u {u_train_flat.nbytes/1e9:.2f} GB")
+    x_val_raw, u_val_raw = build_split_arrays(
+        SIMULATION_RESULTS_DIR, VAL_SCAN_PATTERNS,
+        max_scenarios=MAX_VAL_SCENARIOS, seed=SEED + 1,
+    )
+    n_val = x_val_raw.shape[0]
+    print(f"VAL: {n_val} trajectories  [{time.time()-t0:.1f}s]")
 
-    print(f"Fitting RobustScaler on a {SCALER_FIT_ROWS:,}-row random subsample of TRAIN ...")
-    from sklearn.preprocessing import RobustScaler
-    n_rows = x_train_flat.shape[0]
+    # -----------------------------------------------------------------------
+    # 3. Fit RobustScaler on a random subsample of TRAIN rows
+    # -----------------------------------------------------------------------
+    print(f"\nFitting RobustScaler on up to {SCALER_FIT_ROWS:,} TRAIN rows ...")
+    n_train_flat = n_train * T_SIM
+    x_train_flat = x_train_raw.reshape(n_train_flat, N_STATES)
+    u_train_flat = u_train_raw.reshape(n_train_flat, N_INPUTS)
+
     rng_fit = np.random.RandomState(SEED)
-    if n_rows > SCALER_FIT_ROWS:
-        fit_rows = np.sort(rng_fit.choice(n_rows, SCALER_FIT_ROWS, replace=False))
+    if n_train_flat > SCALER_FIT_ROWS:
+        fit_rows = np.sort(rng_fit.choice(n_train_flat, SCALER_FIT_ROWS, replace=False))
     else:
-        fit_rows = np.arange(n_rows)
+        fit_rows = np.arange(n_train_flat)
+
     scaler_states = RobustScaler().fit(x_train_flat[fit_rows])
     scaler_inputs = RobustScaler().fit(u_train_flat[fit_rows])
     del fit_rows
@@ -448,167 +556,228 @@ def main():
         dump(scaler_states, fh)
     with open(os.path.join(OUTPUT_DIR, "scaler_inputs.pkl"), "wb") as fh:
         dump(scaler_inputs, fh)
-    print(f"  saved scalers to {OUTPUT_DIR}")
+    print(f"  Scalers saved to {OUTPUT_DIR}")
 
-    print("Scaling TRAIN in place ...")
-    transform_in_place(scaler_states, x_train_flat)
-    transform_in_place(scaler_inputs, u_train_flat)
-    x_train = x_train_flat.reshape(len(train_idx), T, n_states)
-    u_train = u_train_flat.reshape(len(train_idx), T, n_inputs)
+    # -----------------------------------------------------------------------
+    # 4. Scale TRAIN in-place  (avoids duplicating the large arrays)
+    # -----------------------------------------------------------------------
+    print("Scaling TRAIN ...")
+    _transform_in_place(scaler_states, x_train_flat)
+    _transform_in_place(scaler_inputs, u_train_flat)
+    x_train = x_train_flat.reshape(n_train, T_SIM, N_STATES)
+    u_train = u_train_flat.reshape(n_train, T_SIM, N_INPUTS)
+    del x_train_raw, u_train_raw, x_train_flat, u_train_flat
 
-    print(f"Loading VAL scenarios ...")
-    t0 = time.time()
-    x_val_flat, u_val_flat = fill_split_buffer(
-        MERGED_MAT_PATH, backend, val_idx, T, n_states, n_inputs)
-    if INPUT_COLUMN_PERM is not None:
-        u_val_flat = np.ascontiguousarray(u_val_flat[:, INPUT_COLUMN_PERM])
-    print(f"  done in {time.time()-t0:.1f}s")
+    # -----------------------------------------------------------------------
+    # 5. Scale VAL in-place
+    # -----------------------------------------------------------------------
+    print("Scaling VAL ...")
+    n_val_flat   = n_val * T_SIM
+    x_val_flat   = x_val_raw.reshape(n_val_flat, N_STATES)
+    u_val_flat   = u_val_raw.reshape(n_val_flat, N_INPUTS)
+    _transform_in_place(scaler_states, x_val_flat)
+    _transform_in_place(scaler_inputs, u_val_flat)
+    x_val = x_val_flat.reshape(n_val, T_SIM, N_STATES)
+    u_val = u_val_flat.reshape(n_val, T_SIM, N_INPUTS)
+    del x_val_raw, u_val_raw, x_val_flat, u_val_flat
 
-    print("Scaling VAL in place ...")
-    transform_in_place(scaler_states, x_val_flat)
-    transform_in_place(scaler_inputs, u_val_flat)
-    x_val = x_val_flat.reshape(len(val_idx), T, n_states)
-    u_val = u_val_flat.reshape(len(val_idx), T, n_inputs)
+    # -----------------------------------------------------------------------
+    # 6. Per-state floor for the soft non-negativity constraint (Eq. 9)
+    # -----------------------------------------------------------------------
+    # floor_i = min observed scaled value across TRAIN, except for C1:
+    # C1 has no ground truth (all zeros) -> physical floor is raw 0.
+    # In scaled space: (0 - center_i) / scale_i  (NOT scaled 0, which = median).
+    state_min = x_train.reshape(-1, N_STATES).min(axis=0)   # (10,)
+    state_min[C1_INDEX] = (
+        (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
+    )
 
-    state_min = x_train.reshape(-1, n_states).min(axis=0)
-    # C1 has no ground-truth minimum; its physical floor is raw 0 (carbs on board >= 0).
-    # In SCALED space raw 0 is (0 - center)/scale. It is NOT 0: scaled 0 equals the median,
-    # which would wrongly penalise every C1 value below the median (~half of all timesteps).
-    state_min[C1_INDEX] = (0.0 - scaler_states.center_[C1_INDEX]) / scaler_states.scale_[C1_INDEX]
+    # -----------------------------------------------------------------------
+    # 7. Glucose penalty thresholds in scaled Q1 space
+    # -----------------------------------------------------------------------
+    lim_inf_scaled = _glucose_mgdl_to_q1_scaled(70,  scaler_states)   # hypo boundary
+    lim_sup_scaled = _glucose_mgdl_to_q1_scaled(250, scaler_states)   # extreme hyper
+    cgm_min_scaled = _glucose_mgdl_to_q1_scaled(40,  scaler_states)   # hard clamp low
+    cgm_max_scaled = _glucose_mgdl_to_q1_scaled(400, scaler_states)   # hard clamp high
+    print(f"\nScaled Q1 thresholds:  70 mg/dL -> {lim_inf_scaled:.4f} | "
+          f"250 mg/dL -> {lim_sup_scaled:.4f} | "
+          f"clamp [{cgm_min_scaled:.4f}, {cgm_max_scaled:.4f}]")
 
-    lim_inferior_scaled = scale_single_state(70, "Q1", OUTPUT_DIR)
-    lim_superior_scaled = scale_single_state(250, "Q1", OUTPUT_DIR)
-    cgm_min_scaled = scale_single_state(40, "Q1", OUTPUT_DIR)
-    cgm_max_scaled = scale_single_state(400, "Q1", OUTPUT_DIR)
-
-    print(f"Building model on device: {DEVICE}")
+    # -----------------------------------------------------------------------
+    # 8. Build model, simulator, loss, optimizer
+    # -----------------------------------------------------------------------
+    print(f"\nBuilding CGMOHSUSimStateSpaceModel_V2  (n_neurons={n_neurons_pop})  on {DEVICE}")
     model = CGMOHSUSimStateSpaceModel_V2(n_feat=n_neurons_pop)
     if WARM_START_CHECKPOINT:
-        print(f"  warm-starting from: {WARM_START_CHECKPOINT}")
+        print(f"  Warm-starting from: {WARM_START_CHECKPOINT}")
         model.load_state_dict(torch.load(WARM_START_CHECKPOINT, map_location=DEVICE))
     model.to(DEVICE)
 
-    simulator = ForwardEulerSimulatorPop(model, cgm_min_scaled, cgm_max_scaled, ts=5.0).to(DEVICE)
-    loss_fn = PopulationLoss(STATE_WEIGHTS, state_min, C1_INDEX, alpha=ALPHA, beta=BETA).to(DEVICE)
-
+    simulator = ForwardEulerSimulatorPop(
+        model, cgm_min_scaled, cgm_max_scaled, ts=5.0
+    ).to(DEVICE)
+    loss_fn = PopulationLoss(
+        STATE_WEIGHTS, state_min, C1_INDEX, alpha=ALPHA, beta=BETA
+    ).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    train_sampler = FramedWindowSampler(x_train, u_train, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED)
-    val_sampler = FramedWindowSampler(x_val, u_val, SEQ_LEN, OVERLAP, BATCH_SIZE, DEVICE, seed=SEED + 1)
-    iters_per_epoch = train_sampler.n_batches_per_epoch()
-    full_iters_per_epoch = iters_per_epoch   # one full pass over every training window
-    val_batches_per_epoch = val_sampler.n_batches_per_epoch()
-    print(f"Windows: train {len(train_sampler.pairs)} ({iters_per_epoch} batches), "
-          f"val {len(val_sampler.pairs)} ({val_batches_per_epoch} batches) | hop={train_sampler.hop}")
+    # -----------------------------------------------------------------------
+    # 9. Window samplers
+    #    Training  : 75 % overlap  (Sec. 2.2.3)
+    #    Validation:  0 % overlap  ("split into sequences ... with no overlap")
+    # -----------------------------------------------------------------------
+    train_sampler = FramedWindowSampler(
+        x_train, u_train, SEQ_LEN, overlap=OVERLAP,
+        batch_size=BATCH_SIZE, device=DEVICE, seed=SEED,
+    )
+    val_sampler = FramedWindowSampler(
+        x_val, u_val, SEQ_LEN, overlap=0.0,          # <-- NO overlap for validation
+        batch_size=BATCH_SIZE, device=DEVICE, seed=SEED + 1,
+    )
+
+    full_iters_per_epoch = train_sampler.n_batches_per_epoch()
+    iters_per_epoch      = full_iters_per_epoch
+    val_bpe              = val_sampler.n_batches_per_epoch()
+    print(f"\nWindows:  train {len(train_sampler.pairs)} ({iters_per_epoch} batches, "
+          f"hop={train_sampler.hop}) | val {len(val_sampler.pairs)} "
+          f"({val_bpe} batches, hop={val_sampler.hop})")
+
     if MAX_TRAIN_BATCHES_PER_EPOCH is not None:
         iters_per_epoch = min(iters_per_epoch, MAX_TRAIN_BATCHES_PER_EPOCH)
     if MAX_VAL_BATCHES_PER_EPOCH is not None:
-        val_batches_per_epoch = min(val_batches_per_epoch, MAX_VAL_BATCHES_PER_EPOCH)
-    print(f"Using {iters_per_epoch} train / {val_batches_per_epoch} val batches per epoch.")
+        val_bpe = min(val_bpe, MAX_VAL_BATCHES_PER_EPOCH)
+    print(f"Using {iters_per_epoch} train / {val_bpe} val batches per epoch.")
 
-    # Paper: LR x e^-0.1 per FULL pass over the training windows. Our capped "epoch" is only a fraction of that.
-    if SCALE_LR_DECAY_TO_FULL_EPOCH:
+    # LR schedule: gamma = e^{-0.1} per FULL data pass; rescale for capped epochs
+    if SCALE_LR_DECAY_TO_FULL_EPOCH and iters_per_epoch < full_iters_per_epoch:
         decay_per_epoch = LR_DECAY_PER_EPOCH ** (iters_per_epoch / full_iters_per_epoch)
     else:
         decay_per_epoch = LR_DECAY_PER_EPOCH
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_per_epoch)
-    print(f"LR decay per epoch: x{decay_per_epoch:.5f} "
-          f"(LR after {MAX_EPOCHS} epochs would be {LR * decay_per_epoch ** MAX_EPOCHS:.2e})")
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_per_epoch)
+    print(f"LR decay/epoch: x{decay_per_epoch:.6f}  "
+          f"(final LR after {MAX_EPOCHS} epochs: {LR * decay_per_epoch**MAX_EPOCHS:.2e})")
 
-    val_fixed_batches = val_sampler.get_fixed_subset(val_batches_per_epoch)
-    print(f"Fixed validation subset: {len(val_fixed_batches)} batches, reused every epoch.")
+    # Fixed validation batch set -- evaluated identically every epoch
+    val_fixed = val_sampler.get_fixed_subset(val_bpe)
+    print(f"Fixed validation subset: {len(val_fixed)} batches.")
 
-    # Timing probe (does real optimizer steps on a few batches; fine as warm-up)
+    # -----------------------------------------------------------------------
+    # 10. Timing probe (also serves as model warm-up)
+    # -----------------------------------------------------------------------
     WARMUP_BATCHES = min(20, iters_per_epoch)
-    print(f"Timing probe: {WARMUP_BATCHES} batches ...")
+    print(f"\nTiming probe ({WARMUP_BATCHES} batches) ...")
     model.train()
     t_probe = time.time()
     for _ in range(WARMUP_BATCHES):
         optimizer.zero_grad()
-        x0, u_batch, x_true = train_sampler.next_batch()
-        x_sim = simulator(x0, u_batch)
-        loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+        x0, u_seq, x_true = train_sampler.next_batch()
+        x_sim = simulator(x0, u_seq)
+        loss, _, _ = loss_fn(x_sim, x_true, lim_inf_scaled, lim_sup_scaled)
         loss.backward()
         optimizer.step()
     if DEVICE.type == "cuda":
         torch.cuda.synchronize()
-    sec_per_batch = (time.time() - t_probe) / WARMUP_BATCHES
-    print(f"  {sec_per_batch:.3f} s/batch -> ~{sec_per_batch * iters_per_epoch / 60:.1f} min/epoch (train) "
-          f"+ ~{sec_per_batch * val_batches_per_epoch / 60:.1f} min val")
-    train_sampler._reshuffle()
+    spb = (time.time() - t_probe) / WARMUP_BATCHES
+    print(f"  {spb:.3f} s/batch  ->  "
+          f"~{spb * iters_per_epoch / 60:.1f} min/epoch (train) + "
+          f"~{spb * val_bpe / 60:.1f} min (val)")
+    train_sampler._reshuffle()   # reset position after probe
 
-    best_val_loss = float("inf")
-    epochs_without_improvement = 0
+    # -----------------------------------------------------------------------
+    # 11. Training loop  (Algorithm 1)
+    # -----------------------------------------------------------------------
+    best_val_loss     = float("inf")
+    epochs_no_improve = 0
+
+    print(f"\n{'='*70}")
+    print(f"Starting training  ({MAX_EPOCHS} epochs, early-stop patience={PATIENCE})")
+    print(f"{'='*70}\n")
 
     for epoch in range(1, MAX_EPOCHS + 1):
+
+        # ---- TRAIN ----
         model.train()
-        epoch_losses = []
-        t_epoch = time.time()
-        print_every = max(1, min(50, iters_per_epoch // 10))
+        train_losses = []
+        t_epoch      = time.time()
+        print_every  = max(1, min(50, iters_per_epoch // 10))
 
         for it in range(iters_per_epoch):
             optimizer.zero_grad()
-            x0, u_batch, x_true = train_sampler.next_batch()
-            x_sim = simulator(x0, u_batch)
+            x0, u_seq, x_true = train_sampler.next_batch()
+            x_sim = simulator(x0, u_seq)
 
             if torch.isnan(x_sim).any() or torch.isinf(x_sim).any():
-                print(f"WARNING: nan/inf in simulation at epoch {epoch} iter {it}, skipping batch")
+                print(f"  WARNING: nan/inf at epoch {epoch} iter {it} -- batch skipped")
                 continue
 
-            loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+            loss, l_fit, l_con = loss_fn(x_sim, x_true, lim_inf_scaled, lim_sup_scaled)
             loss.backward()
             optimizer.step()
-            epoch_losses.append(loss.item())
+            train_losses.append(loss.item())
 
             if (it + 1) % print_every == 0 or (it + 1) == iters_per_epoch:
-                running_mean = np.mean(epoch_losses) if epoch_losses else float("nan")
-                print(f"  epoch {epoch} [train {it+1}/{iters_per_epoch}] "
-                      f"running_loss {running_mean:.6f} | {time.time()-t_epoch:.1f}s elapsed")
+                print(f"  epoch {epoch} [train {it+1:4d}/{iters_per_epoch}]  "
+                      f"loss={np.mean(train_losses):.6f}  "
+                      f"L_fit={l_fit:.6f}  L_cons={l_con:.6f}  "
+                      f"{time.time()-t_epoch:.1f}s")
 
         scheduler.step()
+
+        # ---- VAL ----
         model.eval()
+        val_losses, sq_sum, n_sq = [], 0.0, 0
+        t_val     = time.time()
+        pev       = max(1, min(50, len(val_fixed) // 10))
+
         with torch.no_grad():
-            val_losses = []
-            sq_err_sum = 0.0
-            n_err_vals = 0
-            t_val = time.time()
-            print_every_val = max(1, min(50, len(val_fixed_batches) // 10))
-            for v_it, pair_batch in enumerate(val_fixed_batches):
-                x0, u_batch, x_true = val_sampler.batch_from_pairs(pair_batch)
-                x_sim = simulator(x0, u_batch)
-                loss, _, _ = loss_fn(x_sim, x_true, lim_inferior_scaled, lim_superior_scaled)
+            for vi, pair_batch in enumerate(val_fixed):
+                x0, u_seq, x_true = val_sampler.batch_from_pairs(pair_batch)
+                x_sim = simulator(x0, u_seq)
+                loss, _, _ = loss_fn(x_sim, x_true, lim_inf_scaled, lim_sup_scaled)
                 val_losses.append(loss.item())
 
-                y_sim_mgdl = scale_inverse_Q1(x_sim[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                y_true_mgdl = scale_inverse_Q1(x_true[1:, :, [0]].cpu().numpy(), OUTPUT_DIR)
-                batch_sq_err = (y_sim_mgdl - y_true_mgdl) ** 2
-                sq_err_sum += batch_sq_err.sum()
-                n_err_vals += batch_sq_err.size
+                # Track RMSE in mg/dL for clinical interpretability
+                y_sim_mg  = _q1_scaled_to_mgdl(
+                    x_sim [1:, :, [0]].cpu().numpy(), scaler_states)
+                y_true_mg = _q1_scaled_to_mgdl(
+                    x_true[1:, :, [0]].cpu().numpy(), scaler_states)
+                sq_sum += ((y_sim_mg - y_true_mg) ** 2).sum()
+                n_sq   += y_sim_mg.size
 
-                if (v_it + 1) % print_every_val == 0 or (v_it + 1) == len(val_fixed_batches):
-                    print(f"  epoch {epoch} [val {v_it+1}/{len(val_fixed_batches)}] "
+                if (vi + 1) % pev == 0 or (vi + 1) == len(val_fixed):
+                    print(f"  epoch {epoch} [val  {vi+1:4d}/{len(val_fixed)}]  "
                           f"{time.time()-t_val:.1f}s elapsed")
 
-        mean_train_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
-        mean_val_loss = np.mean(val_losses) if val_losses else float("nan")
-        rmse_mgdl = np.sqrt(sq_err_sum / n_err_vals) if n_err_vals > 0 else float("nan")
+        mean_train = np.mean(train_losses) if train_losses else float("nan")
+        mean_val   = np.mean(val_losses)   if val_losses   else float("nan")
+        rmse_mg    = np.sqrt(sq_sum / n_sq) if n_sq > 0     else float("nan")
+        cur_lr     = optimizer.param_groups[0]["lr"]
 
-        print(f"Epoch {epoch:4d} | train_loss {mean_train_loss:.6f} | val_loss {mean_val_loss:.6f} | "
-              f"val_RMSE {rmse_mgdl:.2f} mg/dL | lr {optimizer.param_groups[0]['lr']:.2e} | "
-              f"time {time.time()-t_epoch:.1f}s | no_improve {epochs_without_improvement}/{PATIENCE}")
+        print(
+            f"\nEpoch {epoch:4d} | "
+            f"train={mean_train:.6f} | val={mean_val:.6f} | "
+            f"RMSE={rmse_mg:.2f} mg/dL | "
+            f"lr={cur_lr:.2e} | "
+            f"time={time.time()-t_epoch:.1f}s | "
+            f"no_improve={epochs_no_improve}/{PATIENCE}\n"
+        )
 
-        if mean_val_loss < best_val_loss:
-            best_val_loss = mean_val_loss
-            epochs_without_improvement = 0
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, MODEL_FILENAME))
-            print(f"  -> new best val_loss, saved to {os.path.join(OUTPUT_DIR, MODEL_FILENAME)}")
+        # ---- Checkpoint ----
+        if mean_val < best_val_loss:
+            best_val_loss     = mean_val
+            epochs_no_improve = 0
+            save_path = os.path.join(OUTPUT_DIR, MODEL_FILENAME)
+            torch.save(model.state_dict(), save_path)
+            print(f"  -> new best val_loss={best_val_loss:.6f}  saved -> {save_path}\n")
         else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= PATIENCE:
-                print(f"Early stopping after {epochs_without_improvement} epochs without improvement.")
+            epochs_no_improve += 1
+            if epochs_no_improve >= PATIENCE:
+                print(f"Early stopping triggered after {epochs_no_improve} "
+                      "epochs without improvement.")
                 break
 
-    print("Training complete. Best model saved at:", os.path.join(OUTPUT_DIR, MODEL_FILENAME))
+    print("\nTraining complete.")
+    print("Best model saved at:", os.path.join(OUTPUT_DIR, MODEL_FILENAME))
 
 
 if __name__ == "__main__":
